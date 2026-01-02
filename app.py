@@ -4,10 +4,9 @@ import time
 import random
 import string
 import json
-from datetime import datetime, timedelta
-
 import requests
-from flask import Flask, redirect, jsonify, request
+from datetime import datetime, timedelta
+from flask import Flask, Response
 from bs4 import BeautifulSoup
 from faker import Faker
 import re
@@ -18,14 +17,52 @@ AJAX_URL = f"{BASE_URL}/wp-admin/admin-ajax.php"
 ACCOUNT_URL = f"{BASE_URL}/my-account/"
 
 CREDENTIALS_FILE = "credentials.txt"
+M3U_CACHE_FILE = "live_cache.m3u"
+M3U_CACHE_TIME_FILE = "live_cache.time"
 TRIAL_VALID_HOURS = 20
+CACHE_MAX_AGE = 20 * 3600  # 20 hours in seconds
 
 fake = Faker()
-
 app = Flask(__name__)
 
-# --- Helper Functions (from your script) ---
+# --- Helper: LIVE-only filter ---
+def make_live_only_m3u(input_path: str, output_path: str) -> None:
+    """
+    Convert an M3U playlist to LIVE-only by removing VOD and Series.
+    Keeps:
+      - #EXTM3U header
+      - #EXTINF lines for LIVE streams
+      - URLs containing /live/
+    Drops:
+      - /movie/
+      - /series/
+    """
+    with open(input_path, "r", encoding="utf-8", errors="ignore") as fin, \
+         open(output_path, "w", encoding="utf-8") as fout:
 
+        last_extinf = None
+
+        for raw_line in fin:
+            line = raw_line.strip()
+
+            if line.startswith("#EXTM3U"):
+                fout.write(line + "\n")
+                continue
+
+            if line.startswith("#EXTINF"):
+                last_extinf = line
+                continue
+
+            # Only keep URLs with /live/ and NOT containing /movie/ or /series/
+            if "/live/" in line and "/movie/" not in line and "/series/" not in line:
+                if last_extinf:
+                    fout.write(last_extinf + "\n")
+                    last_extinf = None
+                fout.write(line + "\n")
+            else:
+                last_extinf = None
+
+# --- Auth & Credential Helpers (from your original code) ---
 def random_suffix(k=4):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
@@ -148,7 +185,6 @@ def fetch_credentials(session):
         "password": soup.select_one(".account-password").get_text(strip=True),
     }
 
-
 def load_latest_credentials():
     if not os.path.exists(CREDENTIALS_FILE):
         return None
@@ -163,7 +199,7 @@ def load_latest_credentials():
             email = lines[-5].split("Email: ")[1].strip()
             username = lines[-4].split("Username: ")[1].strip()
             password = lines[-3].split("Password: ")[1].strip()
-            return {"email": email, "username": username, "password": password, "time": cred_time}
+            return {"email": email, "username": username, "password": password}
     except Exception:
         pass
     return None
@@ -177,11 +213,20 @@ def save_credentials(identity, creds):
         f.write("Server:  http://tvsystem.my:80\n")
         f.write("-" * 40 + "\n")
 
-# --- Flask Route ---
+# --- M3U Caching Logic ---
+def ensure_fresh_m3u():
+    """Ensure we have a fresh LIVE-only M3U cached (<=20h old)."""
+    # Check if cache is fresh
+    if os.path.exists(M3U_CACHE_TIME_FILE):
+        with open(M3U_CACHE_TIME_FILE, "r") as f:
+            try:
+                cached_time = float(f.read().strip())
+                if time.time() - cached_time < CACHE_MAX_AGE:
+                    return  # Cache is still valid
+            except ValueError:
+                pass  # Invalid time file → redownload
 
-@app.route("/get-m3u")
-def get_m3u():
-    # Optional: Add basic auth or IP restriction here in production
+    # Get credentials (refresh if needed)
     creds = load_latest_credentials()
     if not creds:
         identity = generate_identity()
@@ -190,26 +235,54 @@ def get_m3u():
 
         reg = register(session, identity)
         if reg.get("error") != 0:
-            return jsonify({"error": "Registration failed"}), 500
+            raise RuntimeError("Registration failed")
 
         nonce = get_nonce(session)
         if not nonce:
-            return jsonify({"error": "Nonce extraction failed"}), 500
+            raise RuntimeError("Nonce extraction failed")
 
         trial = generate_trial(session, nonce)
         if not trial.get("success"):
-            return jsonify({"error": "Trial generation failed"}), 500
+            raise RuntimeError("Trial generation failed")
 
         creds = fetch_credentials(session)
         save_credentials(identity, creds)
 
-    m3u_url = f"http://tvsystem.my:80/get.php?username={creds['username']}&password={creds['password']}&type=m3u_plus&output=ts"
-    return redirect(m3u_url, code=302)
+    # Download full M3U
+    full_url = f"http://tvsystem.my:80/get.php?username={creds['username']}&password={creds['password']}&type=m3u_plus&output=ts"
+    response = requests.get(full_url, timeout=30)
+    response.raise_for_status()
 
-# Optional: Health check
+    # Save raw M3U temporarily
+    temp_raw = "temp_full.m3u"
+    with open(temp_raw, "wb") as f:
+        f.write(response.content)
+
+    # Filter to LIVE-only
+    make_live_only_m3u(temp_raw, M3U_CACHE_FILE)
+
+    # Update cache timestamp
+    with open(M3U_CACHE_TIME_FILE, "w") as f:
+        f.write(str(time.time()))
+
+    # Clean up
+    if os.path.exists(temp_raw):
+        os.remove(temp_raw)
+
+# --- Flask Route ---
+@app.route("/live.m3u")
+def serve_live_m3u():
+    try:
+        ensure_fresh_m3u()
+        with open(M3U_CACHE_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        return Response(content, mimetype="application/x-mpegURL")
+    except Exception as e:
+        return f"Error: {str(e)}", 500
+
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
