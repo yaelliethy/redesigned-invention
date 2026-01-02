@@ -25,8 +25,8 @@ RUN useradd --create-home --shell /bin/bash app && \
 USER app
 
 # Expose port (Koyeb uses PORT env var, but we set default)
-EXPOSE 5000
+EXPOSE 8000
 
 # Run the application
 # Koyeb sets PORT automatically; Flask respects it via --port $PORT
-CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "--workers", "2", "--timeout", "60", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "60", "app:app"]
