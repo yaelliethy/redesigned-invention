@@ -213,7 +213,6 @@ def save_credentials(identity, creds):
         f.write("Server:  http://tvsystem.my:80\n")
         f.write("-" * 40 + "\n")
 
-# --- M3U Caching Logic ---
 def ensure_fresh_m3u():
     """Ensure we have a fresh LIVE-only M3U cached (<=20h old)."""
     # Check if cache is fresh
@@ -248,27 +247,27 @@ def ensure_fresh_m3u():
         creds = fetch_credentials(session)
         save_credentials(identity, creds)
 
-    # Download full M3U
+    # Download full M3U directly to file (streaming)
     full_url = f"http://tvsystem.my:80/get.php?username={creds['username']}&password={creds['password']}&type=m3u_plus&output=ts"
-    response = requests.get(full_url, timeout=30)
-    response.raise_for_status()
-
-    # Save raw M3U temporarily
     temp_raw = "temp_full.m3u"
-    with open(temp_raw, "wb") as f:
-        f.write(response.content)
+    
+    try:
+        with requests.get(full_url, timeout=30, stream=True) as response:
+            response.raise_for_status()
+            with open(temp_raw, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
-    # Filter to LIVE-only
-    make_live_only_m3u(temp_raw, M3U_CACHE_FILE)
+        # Filter to LIVE-only
+        make_live_only_m3u(temp_raw, M3U_CACHE_FILE)
 
-    # Update cache timestamp
-    with open(M3U_CACHE_TIME_FILE, "w") as f:
-        f.write(str(time.time()))
-
-    # Clean up
-    if os.path.exists(temp_raw):
-        os.remove(temp_raw)
-
+        # Update cache timestamp
+        with open(M3U_CACHE_TIME_FILE, "w") as f:
+            f.write(str(time.time()))
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_raw):
+            os.remove(temp_raw)
 # --- Flask Route ---
 @app.route("/live.m3u")
 def serve_live_m3u():
