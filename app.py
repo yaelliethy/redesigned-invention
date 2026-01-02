@@ -9,6 +9,7 @@ from flask import Flask, Response
 from bs4 import BeautifulSoup
 from faker import Faker
 import re
+import threading
 
 # --- Configuration ---
 BASE_URL = "https://tv.net.pk"
@@ -21,38 +22,30 @@ M3U_CACHE_TIME_FILE = "live_cache.time"
 TRIAL_VALID_HOURS = 20
 CACHE_MAX_AGE = 20 * 3600  # 20 hours in seconds
 
+# Background state
+init_in_progress = False
+init_error = None
+
 fake = Faker()
 app = Flask(__name__)
 
+# Lock for thread safety (basic)
+init_lock = threading.Lock()
+
 # --- Helper: LIVE-only filter ---
 def make_live_only_m3u(input_path: str, output_path: str) -> None:
-    """
-    Convert an M3U playlist to LIVE-only by removing VOD and Series.
-    Keeps:
-      - #EXTM3U header
-      - #EXTINF lines for LIVE streams
-      - URLs containing /live/
-    Drops:
-      - /movie/
-      - /series/
-    """
     with open(input_path, "r", encoding="utf-8", errors="ignore") as fin, \
          open(output_path, "w", encoding="utf-8") as fout:
 
         last_extinf = None
-
         for raw_line in fin:
             line = raw_line.strip()
-
             if line.startswith("#EXTM3U"):
                 fout.write(line + "\n")
                 continue
-
             if line.startswith("#EXTINF"):
                 last_extinf = line
                 continue
-
-            # Only keep URLs with /live/ and NOT containing /movie/ or /series/
             if "/live/" in line and "/movie/" not in line and "/series/" not in line:
                 if last_extinf:
                     fout.write(last_extinf + "\n")
@@ -60,7 +53,6 @@ def make_live_only_m3u(input_path: str, output_path: str) -> None:
                 fout.write(line + "\n")
             else:
                 last_extinf = None
-
 # --- Auth & Credential Helpers (from your original code) ---
 def random_suffix(k=4):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
@@ -212,19 +204,27 @@ def save_credentials(identity, creds):
         f.write("Server:  http://tvsystem.my:80\n")
         f.write("-" * 40 + "\n")
 
+def _background_init():
+    global init_in_progress, init_error
+    try:
+        ensure_fresh_m3u()
+        init_error = None
+    except Exception as e:
+        init_error = str(e)
+    finally:
+        init_in_progress = False
+
 def ensure_fresh_m3u():
-    """Ensure we have a fresh LIVE-only M3U cached (<=20h old)."""
-    # Check if cache is fresh
+    """Same as before — downloads and filters M3U."""
     if os.path.exists(M3U_CACHE_TIME_FILE):
         with open(M3U_CACHE_TIME_FILE, "r") as f:
             try:
                 cached_time = float(f.read().strip())
                 if time.time() - cached_time < CACHE_MAX_AGE:
-                    return  # Cache is still valid
+                    return
             except ValueError:
-                pass  # Invalid time file → redownload
+                pass
 
-    # Get credentials (refresh if needed)
     creds = load_latest_credentials()
     if not creds:
         identity = generate_identity()
@@ -246,7 +246,6 @@ def ensure_fresh_m3u():
         creds = fetch_credentials(session)
         save_credentials(identity, creds)
 
-    # Download full M3U directly to file (streaming)
     full_url = f"http://tvsystem.my:80/get.php?username={creds['username']}&password={creds['password']}&type=m3u_plus&output=ts"
     temp_raw = "temp_full.m3u"
     
@@ -256,31 +255,69 @@ def ensure_fresh_m3u():
             with open(temp_raw, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-
-        # Filter to LIVE-only
         make_live_only_m3u(temp_raw, M3U_CACHE_FILE)
-
-        # Update cache timestamp
         with open(M3U_CACHE_TIME_FILE, "w") as f:
             f.write(str(time.time()))
     finally:
-        # Clean up temp file
         if os.path.exists(temp_raw):
             os.remove(temp_raw)
-# --- Flask Route ---
+
+# --- Flask Routes ---
+
+@app.route("/init")
+def init():
+    global init_in_progress, init_error
+    with init_lock:
+        if init_in_progress:
+            return {"status": "already running"}, 202
+        if os.path.exists(M3U_CACHE_FILE):
+            # Optional: check if still valid
+            if os.path.exists(M3U_CACHE_TIME_FILE):
+                try:
+                    with open(M3U_CACHE_TIME_FILE) as f:
+                        if time.time() - float(f.read()) < CACHE_MAX_AGE:
+                            return {"status": "already cached and fresh"}, 200
+                except:
+                    pass
+        # Start background job
+        init_in_progress = True
+        init_error = None
+        thread = threading.Thread(target=_background_init)
+        thread.daemon = True
+        thread.start()
+        return {"status": "initialization started in background"}, 202
+
 @app.route("/live.m3u")
 def serve_live_m3u():
+    if not os.path.exists(M3U_CACHE_FILE):
+        return "M3U not ready. Call /init first.", 404
+
+    # Optional: check age
+    if os.path.exists(M3U_CACHE_TIME_FILE):
+        try:
+            with open(M3U_CACHE_TIME_FILE, "r") as f:
+                if time.time() - float(f.read()) >= CACHE_MAX_AGE:
+                    # Optionally trigger background refresh (not required)
+                    pass
+        except:
+            pass
+
     try:
-        ensure_fresh_m3u()
         with open(M3U_CACHE_FILE, "r", encoding="utf-8") as f:
             content = f.read()
         return Response(content, mimetype="application/x-mpegURL")
     except Exception as e:
-        return f"Error: {str(e)}", 500
+        return f"Error reading M3U: {str(e)}", 500
 
 @app.route("/health")
 def health():
-    return {"status": "ok"}
+    ready = os.path.exists(M3U_CACHE_FILE)
+    return {
+        "status": "ok",
+        "m3u_ready": ready,
+        "init_in_progress": init_in_progress,
+        "init_error": init_error
+    }
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
